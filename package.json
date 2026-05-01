@@ -1,0 +1,14 @@
+{
+  "name": "chrome-pipe-proxy",
+  "version": "0.1.0",
+  "description": "Multi-client WebSocket front for a single pipe-connected Chrome — bypasses chrome-devtools-mcp#1254 macOS focus theft",
+  "type": "module",
+  "main": "pipe-cdp-proxy.mjs",
+  "scripts": {
+    "start": "node pipe-cdp-proxy.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  },
+  "license": "MIT"
+}
