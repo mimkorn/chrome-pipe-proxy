@@ -13,8 +13,16 @@
  *   [MCP-B] ─┼── WebSocket(localhost:9410) ── Pipe Multiplexer ── stdio ── [Chrome]
  *   [MCP-C] ─┘
  *
- * Per-client request ID remapping prevents collisions; per-session ownership
- * keeps events scoped to the client that created the session.
+ * State sharing:
+ *   - The proxy itself enables Target discovery + auto-attach with Chrome on boot.
+ *   - It caches every Target.targetCreated and Target.attachedToTarget event.
+ *   - When a client calls Target.setDiscoverTargets / Target.setAutoAttach the proxy
+ *     synthesizes the cached events for that client (instead of forwarding to Chrome,
+ *     which would treat the call as a no-op since discovery/auto-attach is already
+ *     enabled by the proxy itself).
+ *   - All session-level events from Chrome are broadcast to every client. Sessions
+ *     are shared across clients — race conditions on stateful commands are possible
+ *     but acceptable for the typical "one primary session, others passive" workflow.
  */
 
 import http from 'http';
@@ -80,7 +88,8 @@ function launchChrome() {
         chromeWritable = null;
         chromeReadable = null;
         chromeBuffer = Buffer.alloc(0);
-        sessionOwners.clear();
+        knownTargets.clear();
+        knownSessions.clear();
         for (const [, req] of pendingRequests) {
             safeSend(req.clientWs, {
                 id: req.originalId,
@@ -100,6 +109,10 @@ function launchChrome() {
             restartTimer = setTimeout(() => {
                 restartTimer = null;
                 launchChrome();
+                // Give Chrome a beat to come up before re-enabling discovery.
+                setTimeout(() => enableProxyDiscovery().catch((e) =>
+                    console.error('[Proxy] Failed to re-enable discovery after restart:', e.message)
+                ), 500);
             }, 2000);
         }
     });
@@ -132,20 +145,21 @@ function sendToChrome(msg) {
 }
 
 // ═══════════════════════════════════════════
-// Multi-client routing
+// State caches (shared across clients)
 // ═══════════════════════════════════════════
 
 let globalIdCounter = 1;
 const pendingRequests = new Map();   // proxyId → { clientWs, originalId, method, createdAt }
-const sessionOwners = new Map();     // sessionId → clientWs
-const clientState = new Map();       // clientWs → { sessions: Set, proxyIds: Set, attachedTargets: Set }
+const clientState = new Map();       // clientWs → { proxyIds: Set, discoveryEnabled: bool, autoAttachEnabled: bool }
+const knownTargets = new Map();      // targetId → targetInfo (latest)
+const knownSessions = new Map();     // sessionId → { targetInfo, waitingForDebugger }
 
 function getOrCreateState(clientWs) {
     if (!clientState.has(clientWs)) {
         clientState.set(clientWs, {
-            sessions: new Set(),
             proxyIds: new Set(),
-            attachedTargets: new Set(),
+            discoveryEnabled: false,
+            autoAttachEnabled: false,
         });
     }
     return clientState.get(clientWs);
@@ -158,35 +172,64 @@ function safeSend(ws, data) {
     ws.send(typeof data === 'string' ? data : JSON.stringify(data));
 }
 
+function broadcastToRealClients(msg) {
+    const payload = JSON.stringify(msg);
+    for (const [ws] of clientState) safeSend(ws, payload);
+}
+
+// ═══════════════════════════════════════════
+// Chrome message routing
+// ═══════════════════════════════════════════
+
+// Set PROXY_DEBUG=1 in the env to trace every CDP message. Off by default
+// because chatty traffic (Page.*, Runtime.*) drowns the log.
+const DEBUG = process.env.PROXY_DEBUG === '1';
+const dbg = (...args) => DEBUG && console.log('[Proxy.dbg]', ...args);
+
 function routeChromeMessage(msg) {
-    // Response: route by id
+    if (DEBUG) {
+        const summary = msg.method
+            ? `EVENT ${msg.method}${msg.sessionId ? ' sess=' + msg.sessionId.substring(0, 8) : ''}`
+            : `RESP id=${msg.id}${msg.sessionId ? ' sess=' + msg.sessionId.substring(0, 8) : ''}${msg.error ? ' ERR=' + msg.error.message : ''}`;
+        dbg('← Chrome', summary);
+    }
+
+    // Always update caches for Target.* events (regardless of routing).
+    if (msg.method === 'Target.targetCreated' && msg.params?.targetInfo) {
+        knownTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
+    } else if (msg.method === 'Target.targetInfoChanged' && msg.params?.targetInfo) {
+        knownTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
+    } else if (msg.method === 'Target.targetDestroyed' && msg.params?.targetId) {
+        knownTargets.delete(msg.params.targetId);
+    } else if (msg.method === 'Target.attachedToTarget' && msg.params?.sessionId) {
+        knownSessions.set(msg.params.sessionId, {
+            targetInfo: msg.params.targetInfo,
+            waitingForDebugger: msg.params.waitingForDebugger ?? false,
+        });
+        if (msg.params.targetInfo) {
+            knownTargets.set(msg.params.targetInfo.targetId, msg.params.targetInfo);
+        }
+    } else if (msg.method === 'Target.detachedFromTarget' && msg.params?.sessionId) {
+        knownSessions.delete(msg.params.sessionId);
+    }
+
+    // Response: route by id back to originating client.
     if (msg.id !== undefined && pendingRequests.has(msg.id)) {
-        const { clientWs, originalId, method } = pendingRequests.get(msg.id);
+        const { clientWs, originalId } = pendingRequests.get(msg.id);
         pendingRequests.delete(msg.id);
         const state = clientState.get(clientWs);
         if (state) state.proxyIds.delete(msg.id);
-
-        // Track session attachments for routing
-        if (method === 'Target.attachToTarget' && msg.result?.sessionId) {
-            const sid = msg.result.sessionId;
-            sessionOwners.set(sid, clientWs);
-            if (state) state.sessions.add(sid);
-        }
-
         msg.id = originalId;
         safeSend(clientWs, msg);
         return;
     }
 
-    // Event: route by sessionId, or broadcast Target.* events
+    // Event from Chrome: broadcast to every connected client.
+    // Sessions are shared across clients (the proxy holds the only real session
+    // to Chrome and exposes it to all). Clients ignore events for sessionIds they
+    // don't track — Puppeteer in particular is tolerant of unknown sessions.
     if (msg.method) {
-        if (msg.sessionId && sessionOwners.has(msg.sessionId)) {
-            safeSend(sessionOwners.get(msg.sessionId), msg);
-            return;
-        }
-        // Browser-level events without sessionId — broadcast (rare)
-        for (const [ws] of clientState) safeSend(ws, msg);
-        return;
+        broadcastToRealClients(msg);
     }
 }
 
@@ -207,7 +250,7 @@ setInterval(() => {
 }, 30000);
 
 // ═══════════════════════════════════════════
-// Internal CDP request (for HTTP discovery)
+// Internal CDP request (proxy-initiated, used for discovery setup + HTTP endpoints)
 // ═══════════════════════════════════════════
 
 function cdpRequest(method, params = {}) {
@@ -216,7 +259,7 @@ function cdpRequest(method, params = {}) {
         const proxyId = globalIdCounter++;
         const timeout = setTimeout(() => {
             pendingRequests.delete(proxyId);
-            reject(new Error('timeout'));
+            reject(new Error(`CDP request '${method}' timed out`));
         }, 5000);
         const fakeClient = {
             send: (data) => {
@@ -233,6 +276,43 @@ function cdpRequest(method, params = {}) {
         });
         sendToChrome({ id: proxyId, method, params });
     });
+}
+
+// On Chrome boot/restart: enable discovery + auto-attach so the proxy receives
+// (and caches) every Target.* event, even before any real clients connect.
+async function enableProxyDiscovery() {
+    if (!chromeWritable) return;
+    await cdpRequest('Target.setDiscoverTargets', { discover: true });
+    await cdpRequest('Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true,
+    });
+    console.log('[Proxy] Discovery + auto-attach enabled by proxy itself');
+}
+
+// ═══════════════════════════════════════════
+// Per-client state replay
+// ═══════════════════════════════════════════
+
+function replayDiscoveryToClient(clientWs) {
+    dbg('replay discovery', knownTargets.size, 'targets');
+    for (const [, targetInfo] of knownTargets) {
+        safeSend(clientWs, {
+            method: 'Target.targetCreated',
+            params: { targetInfo },
+        });
+    }
+}
+
+function replayAutoAttachToClient(clientWs) {
+    dbg('replay auto-attach', knownSessions.size, 'sessions');
+    for (const [sessionId, { targetInfo, waitingForDebugger }] of knownSessions) {
+        safeSend(clientWs, {
+            method: 'Target.attachedToTarget',
+            params: { sessionId, targetInfo, waitingForDebugger },
+        });
+    }
 }
 
 // ═══════════════════════════════════════════
@@ -292,7 +372,8 @@ const server = http.createServer(async (req, res) => {
                 chromeRunning: chromeProcess !== null,
                 chromePid: chromeProcess?.pid || null,
                 clients: clientState.size,
-                sessions: sessionOwners.size,
+                knownTargets: knownTargets.size,
+                knownSessions: knownSessions.size,
                 pendingRequests: pendingRequests.size,
             }, null, 2));
             return;
@@ -330,30 +411,62 @@ wss.on('connection', (clientWs) => {
             return;
         }
 
+        let msg;
         try {
-            const msg = JSON.parse(data.toString());
-
-            // ID remap so multiple clients don't collide
-            if (msg.id !== undefined) {
-                const proxyId = globalIdCounter++;
-                pendingRequests.set(proxyId, {
-                    clientWs,
-                    originalId: msg.id,
-                    method: msg.method,
-                    createdAt: Date.now(),
-                });
-                state.proxyIds.add(proxyId);
-                msg.id = proxyId;
-            }
-
-            sendToChrome(msg);
+            msg = JSON.parse(data.toString());
         } catch (e) {
             console.error('[Proxy] Bad client message:', e.message);
+            return;
         }
+
+        // Intercept discovery + auto-attach so each client gets a fresh stream
+        // of Target.targetCreated / Target.attachedToTarget events for state
+        // that already existed when it connected. Forwarding to Chrome would
+        // be a no-op (the proxy itself already enabled discovery + auto-attach).
+        // Intercept browser-level (no sessionId) discovery + auto-attach so the
+        // client sees the cached state. Per-session calls (sessionId set) are
+        // session-scoped (e.g., iframe auto-attach within a target) and must be
+        // forwarded normally — intercepting them caused infinite replay loops.
+        if (msg.method === 'Target.setDiscoverTargets' && !msg.sessionId) {
+            const enable = msg.params?.discover === true;
+            state.discoveryEnabled = enable;
+            // Match Chrome's ordering: emit initial targetCreated events first,
+            // then respond. Puppeteer captures the events then resolves on response.
+            if (enable) replayDiscoveryToClient(clientWs);
+            if (msg.id !== undefined) {
+                safeSend(clientWs, { id: msg.id, result: {} });
+            }
+            return;
+        }
+        if (msg.method === 'Target.setAutoAttach' && !msg.sessionId) {
+            const enable = msg.params?.autoAttach === true;
+            state.autoAttachEnabled = enable;
+            if (enable) replayAutoAttachToClient(clientWs);
+            if (msg.id !== undefined) {
+                safeSend(clientWs, { id: msg.id, result: {} });
+            }
+            return;
+        }
+
+        // ID remap so multiple clients don't collide on Chrome's request IDs.
+        const origId = msg.id;
+        if (msg.id !== undefined) {
+            const proxyId = globalIdCounter++;
+            pendingRequests.set(proxyId, {
+                clientWs,
+                originalId: msg.id,
+                method: msg.method,
+                createdAt: Date.now(),
+            });
+            state.proxyIds.add(proxyId);
+            msg.id = proxyId;
+        }
+
+        dbg('→ Chrome', `${msg.method}${msg.sessionId ? ' sess=' + msg.sessionId.substring(0, 8) : ''} (cid=${origId} pid=${msg.id})`);
+        sendToChrome(msg);
     });
 
     const cleanup = () => {
-        for (const sid of state.sessions) sessionOwners.delete(sid);
         for (const pid of state.proxyIds) pendingRequests.delete(pid);
         clientState.delete(clientWs);
         console.log(`[Proxy] Client disconnected (remaining: ${clientState.size})`);
@@ -385,4 +498,8 @@ process.on('SIGTERM', shutdown);
 server.listen(PROXY_PORT, '127.0.0.1', () => {
     console.log(`[Proxy] Listening on http://127.0.0.1:${PROXY_PORT}`);
     launchChrome();
+    // Wait a beat for Chrome to come up before enabling discovery.
+    setTimeout(() => enableProxyDiscovery().catch((e) =>
+        console.error('[Proxy] Failed to enable discovery on boot:', e.message)
+    ), 500);
 });
